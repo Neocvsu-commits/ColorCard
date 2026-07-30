@@ -21,3 +21,7 @@ dist/
 # OS
 Thumbs.db
 .DS_Store
+
+# Build
+*.exe
+.build_ColorCard/

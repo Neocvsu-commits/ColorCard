@@ -13,8 +13,10 @@ TEXT_COLOR = "#333333"
 SUB_TEXT_COLOR = "#666666" 
 HIGHLIGHT_COLOR = "#2196F3" 
 
-WHEEL_SIZE = 240 
+WHEEL_SIZE = 240
 CANVAS_SIZE = 512
+TOAST_DURATION = 1800     # ms
+UNDO_MAX = 50             # image snapshots are memory-heavy
 
 # --- 集中式排版引擎 (Centralized Typography Engine) ---
 FONTS = {
@@ -74,24 +76,29 @@ class GridCanvasEditor:
         
         self.image = Image.new('RGB', (CANVAS_SIZE, CANVAS_SIZE), color='white')
         self.tk_image = None
+        self.canvas_image_id = None
         self.wheel_img = None
+        self.has_content = False
+        self._canvas_grid_size = self.grid_size_var.get()
+        self._stroke_active = False
+        self._last_draw_cell = None
+        self._toast_after_id = None
         
         self.picking_active = False
         self.loupe_win = None
-        self.overlays = [] 
-        self.monitors = [] 
+        self.overlays = []
+        self.monitors = []
         self.is_topmost = False
-        
-        self.last_monitor_idx = -1 
+
+        # --- Undo / Redo ---
+        self.undo_stack = []       # list of (Image copy, grid size, has content)
+        self.redo_stack = []
+
+        self.last_monitor_idx = -1
         self.v_min_x = 0
         self.v_min_y = 0
         self.cached_screen = None
-        
-        try:
-            ImageGrab.grab(bbox=(0,0,1,1), all_screens=True)
-            self.use_all_screens = True
-        except TypeError:
-            self.use_all_screens = False
+        self.use_all_screens = True
         
         self.wheel_pixels = []
         self.wheel_mask = None
@@ -133,7 +140,9 @@ class GridCanvasEditor:
         y = max(0, (screen_h - win_h) // 2)
         
         self.root.geometry(f"{int(win_w)}x{int(win_h)}+{int(x)}+{int(y)}")
-        self.root.minsize(1, 1)
+        min_w = min(int(win_w), max(640, screen_w - 40))
+        min_h = min(int(win_h), max(560, screen_h - 80))
+        self.root.minsize(min_w, min_h)
 
     def build_wheel_caches(self):
         render_size = WHEEL_SIZE
@@ -186,12 +195,12 @@ class GridCanvasEditor:
         slider_frame = tk.Frame(left_panel, bg=BG_COLOR)
         slider_frame.pack(fill=tk.X, pady=(0, 8))
 
-        tk.Label(slider_frame, text="饱和度 (Saturation)", bg=BG_COLOR, fg=SUB_TEXT_COLOR, font=FONTS["body"]).pack(anchor="w")
+        tk.Label(slider_frame, text="饱和度", bg=BG_COLOR, fg=SUB_TEXT_COLOR, font=FONTS["body"]).pack(anchor="w")
         self.sat_scale = ttk.Scale(slider_frame, from_=0.0, to=1.0, orient=tk.HORIZONTAL)
         self.sat_scale.pack(fill=tk.X, pady=(0, 5))
         self.sat_scale.set(1.0)
         
-        tk.Label(slider_frame, text="亮度 (Lightness)", bg=BG_COLOR, fg=SUB_TEXT_COLOR, font=FONTS["body"]).pack(anchor="w")
+        tk.Label(slider_frame, text="亮度", bg=BG_COLOR, fg=SUB_TEXT_COLOR, font=FONTS["body"]).pack(anchor="w")
         self.light_scale = ttk.Scale(slider_frame, from_=0.0, to=1.0, orient=tk.HORIZONTAL)
         self.light_scale.pack(fill=tk.X, pady=(0, 0))
         self.light_scale.set(0.5)
@@ -204,7 +213,7 @@ class GridCanvasEditor:
         self.wheel_canvas.bind("<Button-1>", self.on_wheel_interact)
 
         # 核心数据剥离加粗，使用等宽英文，体现极客质感
-        self.info_label = tk.Label(left_panel, text="Base: #FF0000", bg=PANEL_BG, fg=TEXT_COLOR, font=FONTS["data"], pady=6, cursor="hand2")
+        self.info_label = tk.Label(left_panel, text="基色: #FF0000", bg=PANEL_BG, fg=TEXT_COLOR, font=FONTS["data"], pady=6, cursor="hand2")
         self.info_label.pack(fill=tk.X, pady=(5, 8))
         self.info_label.bind("<Button-1>", self.copy_base_color)
 
@@ -215,12 +224,12 @@ class GridCanvasEditor:
         settings_frame.pack(fill=tk.X, pady=(0, 10))
         
         tk.Label(settings_frame, text="笔刷与网格", bg=BG_COLOR, fg=SUB_TEXT_COLOR, font=FONTS["h2"]).pack(anchor="w", pady=(0, 2))
-        ttk.Radiobutton(settings_frame, text="纯色绘制 (Solid)", variable=self.brush_mode, value="solid").pack(anchor="w", pady=1)
-        ttk.Radiobutton(settings_frame, text="随机色相 (Random Hue)", variable=self.brush_mode, value="random_hue").pack(anchor="w", pady=1)
+        ttk.Radiobutton(settings_frame, text="纯色绘制", variable=self.brush_mode, value="solid").pack(anchor="w", pady=1)
+        ttk.Radiobutton(settings_frame, text="随机色相", variable=self.brush_mode, value="random_hue").pack(anchor="w", pady=1)
         
         size_frame = tk.Frame(settings_frame, bg=BG_COLOR)
         size_frame.pack(fill=tk.X, pady=(8, 0))
-        tk.Label(size_frame, text="网格尺寸 (Grid Size):", bg=BG_COLOR, font=FONTS["body"]).pack(side=tk.LEFT)
+        tk.Label(size_frame, text="网格尺寸:", bg=BG_COLOR, font=FONTS["body"]).pack(side=tk.LEFT)
         size_cb = ttk.Combobox(size_frame, textvariable=self.grid_size_var, values=[2, 4, 8, 16, 32, 64], state="readonly", width=8)
         size_cb.pack(side=tk.RIGHT)
         size_cb.bind("<<ComboboxSelected>>", self.on_grid_size_change)
@@ -228,11 +237,11 @@ class GridCanvasEditor:
         btn_frame = tk.Frame(left_panel, bg=BG_COLOR)
         btn_frame.pack(fill=tk.X, pady=(15, 0)) 
         
-        ttk.Button(btn_frame, text="全屏填充 (Fill All)", style="Tool.TButton", command=self.action_fill_all).pack(fill=tk.X, pady=3)
-        ttk.Button(btn_frame, text="打乱颜色 (Randomize)", style="Tool.TButton", command=self.action_randomize).pack(fill=tk.X, pady=3)
-        ttk.Button(btn_frame, text="按色阶排序 (Sort)", style="Tool.TButton", command=self.action_sort).pack(fill=tk.X, pady=3)
-        ttk.Button(btn_frame, text="从图片导入 (Import)", style="Tool.TButton", command=self.import_images).pack(fill=tk.X, pady=3)
-        ttk.Button(btn_frame, text="保存色卡 (Export PNG)", style="Accent.TButton", command=self.save_image).pack(fill=tk.X, pady=3)
+        ttk.Button(btn_frame, text="全屏填充", style="Tool.TButton", command=self.action_fill_all).pack(fill=tk.X, pady=3)
+        ttk.Button(btn_frame, text="打乱颜色", style="Tool.TButton", command=self.action_randomize).pack(fill=tk.X, pady=3)
+        ttk.Button(btn_frame, text="按色阶排序", style="Tool.TButton", command=self.action_sort).pack(fill=tk.X, pady=3)
+        ttk.Button(btn_frame, text="从图片导入", style="Tool.TButton", command=self.import_images).pack(fill=tk.X, pady=3)
+        ttk.Button(btn_frame, text="导出 PNG", style="Accent.TButton", command=self.save_image).pack(fill=tk.X, pady=3)
 
         # --- 弹性右侧面板 ---
         right_panel = tk.Frame(main_container, bg=PANEL_BG, bd=1, relief=tk.SOLID)
@@ -277,12 +286,55 @@ class GridCanvasEditor:
         self.canvas = tk.Canvas(center_helper, width=CANVAS_SIZE, height=CANVAS_SIZE, bg="white", highlightthickness=0)
         self.canvas.pack()
 
-        self.canvas.bind("<Button-1>", self.on_canvas_click)
-        self.canvas.bind("<B1-Motion>", self.on_canvas_click)
+        self.canvas.bind("<Button-1>", self.on_canvas_press)
+        self.canvas.bind("<B1-Motion>", self.on_canvas_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_canvas_release)
         self.canvas.bind("<Motion>", self.on_canvas_hover)
         self.canvas.bind("<Leave>", self.on_canvas_leave)
 
         self.toast_label = tk.Label(self.root, text="", bg="#333333", fg="#FFFFFF", padx=12, pady=6, font=FONTS["body"])
+
+        # --- Keyboard shortcuts ---
+        self.root.bind("<Control-z>", lambda e: self.undo())
+        self.root.bind("<Control-y>", lambda e: self.redo())
+        self.root.bind("<Control-s>", lambda e: self.save_image())
+        self.root.bind("<Control-o>", lambda e: self.import_images())
+
+    def _current_state(self):
+        return (
+            self.image.copy(),
+            self._canvas_grid_size,
+            self.has_content,
+        )
+
+    def _push_undo(self):
+        """Record one complete user operation for undo."""
+        self.undo_stack.append(self._current_state())
+        if len(self.undo_stack) > UNDO_MAX:
+            self.undo_stack.pop(0)
+        self.redo_stack.clear()
+
+    def _restore_state(self, state):
+        image, grid_size, has_content = state
+        self.image = image.copy()
+        self._canvas_grid_size = grid_size
+        self.grid_size_var.set(grid_size)
+        self.has_content = has_content
+        self.update_canvas_display()
+
+    def undo(self):
+        if not self.undo_stack:
+            return
+        self.redo_stack.append(self._current_state())
+        self._restore_state(self.undo_stack.pop())
+        self.show_toast(f"撤销 (剩余 {len(self.undo_stack)} 步)")
+
+    def redo(self):
+        if not self.redo_stack:
+            return
+        self.undo_stack.append(self._current_state())
+        self._restore_state(self.redo_stack.pop())
+        self.show_toast(f"重做 (剩余 {len(self.redo_stack)} 步)")
 
     def toggle_rgb_mode(self):
         self.is_rgb_mode = not self.is_rgb_mode
@@ -315,8 +367,10 @@ class GridCanvasEditor:
             pos = int(i * step)
             draw.line([(pos, 0), (pos, CANVAS_SIZE)], fill="#E6E6E6", width=1)
             draw.line([(0, pos), (CANVAS_SIZE, pos)], fill="#E6E6E6", width=1)
-            
+
         draw.rectangle([0, 0, CANVAS_SIZE-1, CANVAS_SIZE-1], outline="#CCCCCC", width=1)
+        self._canvas_grid_size = size
+        self.has_content = False
         self.update_canvas_display()
 
     def toggle_topmost(self):
@@ -357,22 +411,32 @@ class GridCanvasEditor:
         self.root.update()
         self.root.after(100, self._init_screen_grab)
 
+    def _capture_screen(self):
+        if self.use_all_screens:
+            try:
+                return ImageGrab.grab(all_screens=True)
+            except (TypeError, OSError):
+                self.use_all_screens = False
+        return ImageGrab.grab()
+
     def _init_screen_grab(self):
         self.picking_active = True
         self.monitors = self.get_monitors()
-        if not self.monitors: 
-             self.monitors = [(0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight())]
+        if not self.monitors:
+            self.monitors = [(0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight())]
 
         self.v_min_x = min(m[0] for m in self.monitors)
         self.v_min_y = min(m[1] for m in self.monitors)
 
         try:
-            if self.use_all_screens:
-                self.cached_screen = ImageGrab.grab(all_screens=True)
-            else:
-                self.cached_screen = ImageGrab.grab()
-        except Exception:
-            self.cached_screen = ImageGrab.grab()
+            self.cached_screen = self._capture_screen()
+        except Exception as exc:
+            self.picking_active = False
+            self.cached_screen = None
+            self.root.deiconify()
+            self.root.lift()
+            messagebox.showerror("屏幕取色不可用", f"当前环境无法读取屏幕画面。\n\n{exc}")
+            return
 
         self.last_monitor_idx = -1 
 
@@ -544,10 +608,10 @@ class GridCanvasEditor:
         
         if hasattr(self, 'info_label'):
             if self.is_rgb_mode:
-                self.info_label.config(text=f"Base: {rgb[0]}, {rgb[1]}, {rgb[2]}")
+                self.info_label.config(text=f"基色: {rgb[0]}, {rgb[1]}, {rgb[2]}")
             else:
                 hex_c = f"#{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X}"
-                self.info_label.config(text=f"Base: {hex_c}")
+                self.info_label.config(text=f"基色: {hex_c}")
         
         if update_wheel:
             self.update_wheel_image()
@@ -555,15 +619,35 @@ class GridCanvasEditor:
             self.draw_wheel_handle()
 
     def on_grid_size_change(self, event):
-        self.root.focus() 
-        self.init_empty_grid() 
+        self.root.focus()
+        new_size = self.grid_size_var.get()
+        if new_size == self._canvas_grid_size:
+            return
+        self._push_undo()
+        self.init_empty_grid()
 
     def update_canvas_display(self):
         if self.image.size != (CANVAS_SIZE, CANVAS_SIZE):
             self.image = self.image.resize((CANVAS_SIZE, CANVAS_SIZE), Image.NEAREST)
-        
+
         self.tk_image = ImageTk.PhotoImage(self.image)
-        self.canvas.create_image(0, 0, image=self.tk_image, anchor=tk.NW)
+        if self.canvas_image_id is None:
+            self.canvas_image_id = self.canvas.create_image(
+                0, 0, image=self.tk_image, anchor=tk.NW
+            )
+        else:
+            self.canvas.itemconfig(self.canvas_image_id, image=self.tk_image)
+        self._update_empty_hint()
+
+    def _update_empty_hint(self):
+        """Show guidance until the user creates or imports color data."""
+        self.canvas.delete("empty_hint")
+        if not self.has_content:
+            self.canvas.create_text(
+                CANVAS_SIZE // 2, CANVAS_SIZE // 2,
+                text="点击“从图片导入”或使用色环开始绘制",
+                fill="#999999", font=FONTS["body"], tags="empty_hint",
+            )
 
     def on_canvas_hover(self, event):
         size = self.grid_size_var.get()
@@ -585,25 +669,55 @@ class GridCanvasEditor:
         self.canvas.delete("hover_highlight")
         self.canvas.config(cursor="")
 
-    def on_canvas_click(self, event):
+    def _event_cell(self, event):
         size = self.grid_size_var.get()
         step = CANVAS_SIZE // size
         col, row = event.x // step, event.y // step
-        
         if 0 <= col < size and 0 <= row < size:
-            x1, y1 = col * step, row * step
-            draw = ImageDraw.Draw(self.image)
-            h, s, l = self.current_hsl
-            
-            if self.brush_mode.get() == "random_hue":
-                r, g, b = ColorHarmony.hsl_to_rgb(random.random(), s, l)
-            else:
-                r, g, b = ColorHarmony.hsl_to_rgb(h, s, l)
-            
-            draw.rectangle([x1, y1, x1+step, y1+step], fill=(r, g, b))
-            self.update_canvas_display()
+            return col, row, step
+        return None
+
+    def _draw_canvas_cell(self, cell):
+        col, row, step = cell
+        if self._last_draw_cell == (col, row):
+            return
+
+        self._last_draw_cell = (col, row)
+        x1, y1 = col * step, row * step
+        draw = ImageDraw.Draw(self.image)
+        h, s, l = self.current_hsl
+
+        if self.brush_mode.get() == "random_hue":
+            r, g, b = ColorHarmony.hsl_to_rgb(random.random(), s, l)
+        else:
+            r, g, b = ColorHarmony.hsl_to_rgb(h, s, l)
+
+        draw.rectangle([x1, y1, x1+step, y1+step], fill=(r, g, b))
+        self.has_content = True
+        self.update_canvas_display()
+
+    def on_canvas_press(self, event):
+        cell = self._event_cell(event)
+        if cell is None:
+            return
+        self._push_undo()
+        self._stroke_active = True
+        self._last_draw_cell = None
+        self._draw_canvas_cell(cell)
+
+    def on_canvas_drag(self, event):
+        if not self._stroke_active:
+            return
+        cell = self._event_cell(event)
+        if cell is not None:
+            self._draw_canvas_cell(cell)
+
+    def on_canvas_release(self, event=None):
+        self._stroke_active = False
+        self._last_draw_cell = None
 
     def action_fill_all(self):
+        self._push_undo()
         draw = ImageDraw.Draw(self.image)
         size = self.grid_size_var.get()
         step = CANVAS_SIZE // size
@@ -617,9 +731,14 @@ class GridCanvasEditor:
                      r, g, b = ColorHarmony.hsl_to_rgb(h, s, l)
                 draw.rectangle([i*step, j*step, (i+1)*step, (j+1)*step], fill=(r,g,b))
         
+        self.has_content = True
         self.update_canvas_display()
 
     def action_randomize(self):
+        if not self.has_content:
+            self.show_toast("当前没有可打乱的颜色")
+            return
+        self._push_undo()
         size = self.grid_size_var.get()
         step = CANVAS_SIZE // size
         
@@ -643,6 +762,10 @@ class GridCanvasEditor:
         self.update_canvas_display()
 
     def action_sort(self):
+        if not self.has_content:
+            self.show_toast("当前没有可排序的颜色")
+            return
+        self._push_undo()
         size = self.grid_size_var.get()
         step = CANVAS_SIZE // size
         
@@ -679,9 +802,13 @@ class GridCanvasEditor:
         self.update_canvas_display()
 
     def import_images(self):
-        paths = filedialog.askopenfilenames(title="选择图片以提取色板 (可多选)", filetypes=[("Image files", "*.png;*.jpg;*.jpeg;*.bmp")])
+        paths = filedialog.askopenfilenames(title="选择图片以提取色板（可多选）", filetypes=[("图片文件", "*.png;*.jpg;*.jpeg;*.bmp")])
         if not paths: return
-        
+
+        # Loading feedback
+        self.root.config(cursor="watch")
+        self.root.update_idletasks()
+
         try:
             size = self.grid_size_var.get()
             total_cells = size * size
@@ -708,31 +835,50 @@ class GridCanvasEditor:
                 
             random.shuffle(extracted_colors)
 
+            # Snapshot before mutating canvas
+            self._push_undo()
+
             draw = ImageDraw.Draw(self.image)
             step = CANVAS_SIZE // size
             idx = 0
-            for j in range(size):     
-                for i in range(size): 
+            for j in range(size):
+                for i in range(size):
                     if idx < len(extracted_colors):
                         x, y = i*step, j*step
                         draw.rectangle([x, y, x+step, y+step], fill=extracted_colors[idx])
                         idx += 1
-                        
+
+            self.has_content = True
             self.update_canvas_display()
-            
+
+            self.root.config(cursor="")
             self.show_toast(f"成功提取 {num_images} 张图片的色板！可点击排序或打乱寻找灵感。")
         except Exception as e:
+            self.root.config(cursor="")
             messagebox.showerror("提取失败", str(e))
 
     def save_image(self):
         path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG", "*.png")])
         if path:
-            self.image.save(path)
+            try:
+                self.image.save(path)
+                import os
+                self.show_toast(f"色卡已保存→ {os.path.basename(path)}")
+            except Exception as e:
+                messagebox.showerror("保存失败", str(e))
 
     def show_toast(self, text):
+        if self._toast_after_id is not None:
+            self.root.after_cancel(self._toast_after_id)
         self.toast_label.config(text=text)
         self.toast_label.place(relx=0.5, rely=0.9, anchor=tk.CENTER)
-        self.root.after(1500, lambda: self.toast_label.place_forget())
+        self._toast_after_id = self.root.after(
+            TOAST_DURATION, self._hide_toast
+        )
+
+    def _hide_toast(self):
+        self.toast_label.place_forget()
+        self._toast_after_id = None
 
 if __name__ == "__main__":
     try:
